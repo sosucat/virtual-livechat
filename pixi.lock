@@ -767,7 +767,7 @@ packages:
 - pypi: ./
   name: virtual-livechat
   version: 0.1.0
-  sha256: 6cdf02b624b97b119206ffec1e841573db4279ea9c8c3f9eb72b0629d83eb541
+  sha256: 5199aba2a4c6f3f3ab1036663a0e2996681f01517c4502af189460363c083ada
   requires_dist:
   - ollama>=0.6.2,<0.7
   requires_python: '>=3.11'
