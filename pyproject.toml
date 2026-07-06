@@ -1,9 +1,9 @@
 [project]
 authors = [{name = "sosucat", email = "pengu1n.i843@gmail.com"}]
-dependencies = []
 name = "virtual-livechat"
 requires-python = ">= 3.11"
 version = "0.1.0"
+dependencies = ["ollama>=0.6.2,<0.7"]
 
 [build-system]
 build-backend = "hatchling.build"
@@ -21,5 +21,4 @@ virtual_livechat = { path = ".", editable = true }
 [tool.pixi.dependencies]
 python = ">=3.14.6,<3.15"
 pyautogui = ">=0.9.54,<0.10"
-ollama = ">=0.24.0,<0.25"
 pillow = ">=12.3.0,<13"
