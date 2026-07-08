@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import random
+import base64
 import pyautogui
 import ollama
 import re
@@ -10,6 +11,7 @@ import shutil
 import subprocess
 import difflib
 import threading
+import urllib.parse
 from collections import deque
 # Optional OCR support
 try:
@@ -119,7 +121,7 @@ def record_spoken_context(duration=4):
 # Choose default model: prefer llava if it's already available locally via the Ollama CLI.
 # Fallback to moondream otherwise.
 def _choose_default_model():
-    preferred = 'llava'
+    preferred = 'minicpm-v'
     fallback = 'moondream'
     try:
         if shutil.which('ollama') is None:
@@ -166,318 +168,424 @@ def _list_monitors_windows():
 
 
 def capture_screen():
-    """Capture the second monitor (index 1) on Windows using PIL.ImageGrab. Fallback to pyautogui full-screen.
+    """Capture the full screen on Windows, returning path to saved PNG screenshot (temp_screen.png).
 
-    Returns path to saved PNG screenshot (temp_screen.png).
+    Tries:
+      1. PIL.ImageGrab.grab() without bbox (grabs the entire virtual screen)
+      2. PIL.ImageGrab.grab() with all monitors merged via ctypes
+      3. pyautogui.screenshot() as fallback
     """
     screenshot_path = "temp_screen.png"
-    # Try Windows monitor listing via ctypes + PIL
+
+    # Method 1: PIL ImageGrab.grab() with no bbox — captures the whole virtual screen
     try:
-        monitors = _list_monitors_windows()
-        if monitors:
-            # choose second monitor if present, otherwise primary
-            mon = monitors[2] if len(monitors) >= 3 else monitors[0]
-            left = mon['left']; top = mon['top']; right = left + mon['width']; bottom = top + mon['height']
-            img = ImageGrab.grab(bbox=(left, top, right, bottom))
+        img = ImageGrab.grab()
+        if img.getbbox() is not None and img.size != (1, 1):
             img.save(screenshot_path)
             return screenshot_path
     except Exception:
-        # fall back to pyautogui
         pass
 
-    # Fallback: whole-screen screenshot via pyautogui
+    # Method 2: Grab using explicit monitor bounds via ctypes
+    try:
+        monitors = _list_monitors_windows()
+        if monitors:
+            all_left = min(m['left'] for m in monitors)
+            all_top = min(m['top'] for m in monitors)
+            all_right = max(m['left'] + m['width'] for m in monitors)
+            all_bottom = max(m['top'] + m['height'] for m in monitors)
+            img = ImageGrab.grab(bbox=(all_left, all_top, all_right, all_bottom))
+            if img.getbbox() is not None and img.size != (1, 1):
+                img.save(screenshot_path)
+                return screenshot_path
+    except Exception:
+        pass
+
+    # Method 3: Fallback via pyautogui
     try:
         screenshot = pyautogui.screenshot()
-        screenshot.save(screenshot_path)
-        return screenshot_path
+        if screenshot.getbbox() is not None and screenshot.size != (1, 1):
+            screenshot.save(screenshot_path)
+            return screenshot_path
     except Exception:
-        # As a last resort, create a blank 1x1 PNG so callers don't crash
-        from PIL import Image
-        Image.new('RGB', (1,1), (0,0,0)).save(screenshot_path)
-        return screenshot_path
+        pass
+
+    # Method 4: Last resort — try MSS (captures D3D/GPU surfaces on Windows more reliably)
+    try:
+        import mss
+        with mss.mss() as sct:
+            mon = sct.monitors[1]  # primary monitor
+            sct_img = sct.grab(mon)
+            from PIL import Image as PILImage
+            img = PILImage.frombytes('RGB', (sct_img.width, sct_img.height), sct_img.rgb)
+            img.save(screenshot_path)
+            return screenshot_path
+    except Exception:
+        pass
+
+    # Method 5: Absolute fallback — 1x1 black pixel so callers don't crash
+    from PIL import Image
+    Image.new('RGB', (1, 1), (0, 0, 0)).save(screenshot_path)
+    return screenshot_path
+
+# Optional web search support using DuckDuckGo (no API key needed)
+try:
+    from ddgs import DDGS
+    WEB_SEARCH_AVAILABLE = True
+except Exception:
+    try:
+        from duckduckgo_search import DDGS
+        WEB_SEARCH_AVAILABLE = True
+    except Exception:
+        WEB_SEARCH_AVAILABLE = False
+
+
+def _extract_description(content_text: str) -> str:
+    """Extract the DESCRIPTION line from the model's structured output."""
+    for line in content_text.strip().splitlines():
+        line = line.strip()
+        if line.upper().startswith("DESCRIPTION"):
+            # Return everything after "DESCRIPTION:" or "DESCRIPTION -"
+            desc = re.sub(r'^DESCRIPTION\s*[:\-]?\s*', '', line, flags=re.IGNORECASE).strip()
+            if desc:
+                return desc
+    return ""
+
+
+def _extract_keywords(description: str) -> str:
+    """Extract specific, searchable keywords from a vision description.
+
+    Returns a compact keyword string suitable for web search, or empty string
+    if the description is too generic to yield meaningful results.
+
+    Examples:
+      "A web browser is open to an academic research paper page titled 'The Best Techni'"
+        → "" (too generic, no specific named entity)
+
+      "A webpage with information about Sosuke Ichihashi and his work as a PhD student"
+        → "Sosuke Ichihashi" (proper name extracted)
+
+      "Minecraft gameplay with a player building a house in a forest biome"
+        → "Minecraft" (game title extracted)
+
+      "A YouTube video about the latest iPhone 16 Pro Max review"
+        → "iPhone 16 Pro Max" (product name extracted)
+    """
+    if not description or len(description) < 10:
+        return ""
+
+    # Common generic patterns that indicate no specific searchable entity
+    generic_patterns = [
+        r'a\s+web\s+(browser|page|site)\s+is\s+open',
+        r'a\s+(web\s+)?browser\s+(window|tab)',
+        r'(browsing|viewing|looking\s+at)\s+(a\s+)?(web\s+)?(page|site|browser)',
+        r'(open|showing|displaying)\s+(a\s+)?(web\s+)?(page|site|browser|document)',
+        r'(academic|research|scientific)\s+(paper|article|journal)',
+        r'(desktop|home\s*screen|start\s*menu|taskbar)',
+        r'(file\s+explorer|finder|file\s+manager)',
+        r'(code\s+editor|ide|terminal|command\s+prompt)',
+        r'(settings|configuration|preferences)\s+(window|menu|screen)',
+        r'(loading|waiting|buffering)',
+        r'(blank|empty|black|dark)\s+(screen|page)',
+    ]
+    for pat in generic_patterns:
+        if re.search(pat, description, re.IGNORECASE):
+            return ""
+
+    # Try to extract proper names / specific entities:
+    # 1. Look for quoted text (likely titles, names, products)
+    quoted = re.findall(r'"([^"]+)"', description)
+    if quoted:
+        # Use the longest quoted phrase as the search query
+        best = max(quoted, key=len).strip()
+        if len(best) >= 3:
+            return best[:80]
+
+    # 2. Look for capitalized multi-word phrases (proper nouns, game titles, product names)
+    #    e.g. "Sosuke Ichihashi", "iPhone 16 Pro Max", "Minecraft"
+    proper_nouns = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', description)
+    if proper_nouns:
+        # Use the longest proper noun phrase
+        best = max(proper_nouns, key=len).strip()
+        if len(best) >= 3:
+            return best[:80]
+
+    # 3. Look for single capitalized words that are not common words
+    single_caps = re.findall(r'\b([A-Z][a-z]{2,})\b', description)
+    # Filter out common English words that happen to be capitalized at start of sentence
+    common_caps = {'The', 'This', 'That', 'These', 'Those', 'What', 'When', 'Where',
+                   'Which', 'Who', 'How', 'Why', 'A', 'An', 'It', 'Its', 'They',
+                   'Their', 'There', 'Here', 'Then', 'Than', 'But', 'And', 'Or',
+                   'For', 'Not', 'With', 'Without', 'From', 'About', 'Some', 'Can',
+                   'Will', 'Would', 'Could', 'Should', 'May', 'Might', 'Must',
+                   'One', 'Two', 'First', 'Second', 'Last', 'Next', 'Previous',
+                   'Screen', 'Image', 'Picture', 'Photo', 'Screenshot', 'Window',
+                   'Page', 'Website', 'Webpage', 'Browser', 'Desktop', 'File',
+                   'Folder', 'Document', 'Text', 'Video', 'Game', 'App', 'Application'}
+    specific = [w for w in single_caps if w not in common_caps]
+    if specific:
+        # Return the first specific capitalized word (likely the key entity)
+        return specific[0][:80]
+
+    # 4. If description contains a known game/app name pattern (e.g. "Minecraft", "YouTube", "Spotify")
+    known_entities = re.findall(
+        r'\b(Minecraft|YouTube|Spotify|Netflix|Discord|Slack|Notion|Photoshop|'
+        r'Chrome|Firefox|Edge|Safari|Word|Excel|PowerPoint|Outlook|Teams|'
+        r'Zoom|VSCode|PyCharm|IntelliJ|Android|iOS|Windows|macOS|Linux|'
+        r'Twitter|Instagram|Facebook|Reddit|TikTok|Snapchat|WhatsApp|Telegram|'
+        r'GitHub|GitLab|Bitbucket|StackOverflow|Wikipedia|Amazon|Google|Bing)\b',
+        description, re.IGNORECASE
+    )
+    if known_entities:
+        return known_entities[0]
+
+    return ""
+
+
+def _search_web(query: str, max_results: int = 3) -> str:
+    """Search the web using DuckDuckGo and return a compact summary of results."""
+    if not WEB_SEARCH_AVAILABLE or not query.strip():
+        return ""
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if not results:
+            return ""
+        snippets = []
+        for r in results:
+            title = r.get('title', '').strip()
+            body = r.get('body', '').strip()
+            if title and body:
+                snippets.append(f"{title}: {body[:200]}")
+            elif body:
+                snippets.append(body[:200])
+        if snippets:
+            return " | ".join(snippets)
+        return ""
+    except Exception as e:
+        _safe_print(f"[Info] Web search failed: {e}")
+        return ""
+
 
 def generate_chat_reactions(image_path, user_context=None):
     """Sends the screenshot to the local model and requests chat reactions.
 
-    user_context: optional string provided by the user (e.g., from speech-to-text).
+    Uses a two-phase approach:
+      1. Vision model describes the screen.
+      2. Web search enriches context based on the description.
+      3. Vision model generates reactions with the enriched context.
     """
-    base_prompt = (
-        "You are an active live streaming chat audience (like Twitch or YouTube Live) watching a remote worker working on their PC. "
-        "First, carefully inspect the screenshot and provide 1–2 short factual observations ABOUT WHAT IS VISIBLY ON THE SCREEN. "
-        "Be literal and do NOT infer intentions, identities, or unseen context. Keep observations to concrete visible elements.\n\n"
-        "Then, using ONLY those observations, write 3 to 5 distinct short chat reactions (1 line each) that a live audience would make. Reactions must reference only the facts you listed and must NOT hallucinate details. Use typical internet slang and emotes when appropriate.\n\n"
-        "OUTPUT FORMAT (exact):\n"
-        "FACTS:\n"
-        "- <one factual observation per line, 1–2 lines>\n\n"
-        "REACTIONS:\n"
-        "- <reaction line 1>\n"
-        "- <reaction line 2>\n"
-        "- <reaction line 3>\n\n"
-        "If the image is unreadable or blank, the FACTS section should contain a single line: '- UNREADABLE_IMAGE' and the REACTIONS section should be empty (no reaction lines).\n\n"
+    # Encode the image as base64 for the ollama library (v0.6+ expects base64 data, not file paths)
+    try:
+        with open(image_path, 'rb') as f:
+            image_data = base64.b64encode(f.read()).decode('utf-8')
+    except Exception as e:
+        print(f"[Error] Failed to read/encode screenshot: {e}")
+        return []
+
+    # --- Phase 1: Get a description from the vision model ---
+    describe_prompt = (
+        "Look closely at this screenshot. Write a one-sentence DESCRIPTION of the specific "
+        "activity, text, or game visible on the screen. Be specific — name the game, app, "
+        "website, or activity if you can identify it.\n\n"
+        "Output exactly in this format:\n"
+        "DESCRIPTION: <what you see>"
     )
 
-    # Optionally run OCR to extract visible text and include it as a preliminary FACT
     ocr_text = None
     if OCR_AVAILABLE:
         try:
             img = Image.open(image_path)
             ocr_text = pytesseract.image_to_string(img).strip()
             img.close()
-            if ocr_text:
-                base_prompt += "If any readable text is visible on the screen, include it as a FACT line prefixed with 'OCR_TEXT: '.\n\n"
         except Exception:
             ocr_text = None
 
-    # Add a couple few-shot examples to anchor expected format and style
-    examples = (
-        "Example 1:\nFACTS:\n- A red health bar at top-left\n- Large white text at bottom: YOU DIED\n\nREACTIONS:\n- Pog that last hit!\n- No way, clutch comeback incoming\n- RIP, deserves a respawn\n\n"
-        "Example 2:\nFACTS:\n- A browser window showing a music player with play/pause icon\n- Large yellow 'LIVE' badge at top-right\n\nREACTIONS:\n- This track slapsss 🔥\n- Tune in, this is the vibe\n- Turn it up, chat!\n\n"
-        "Example 3:\nFACTS:\n- A code editor with a highlighted compiler error on line 42\n- The error message contains 'NullReferenceException'\n\nREACTIONS:\n- Oh no, null refs strikes again 😬\n- Somebody call the debugger!\n- Patch incoming, squad\n\n"
-        "Example 4:\nFACTS:\n- A document editor showing large text: 'Quarterly Report - Draft'\n- A small comment bubble on the right saying 'Please review figures'\n\nREACTIONS:\n- Oof, crunch time for that report 📊\n- Review the numbers, don't trust auto-format!\n- Someone send coffee ☕\n\n"
-        "Example 5:\nFACTS:\n- A video player paused at 01:23 with big 'LIVE' indicator\n- The play button is visible and the timeline is near the end\n\nREACTIONS:\n- Let's goooo, final boss time!\n- That cliffhanger though 😱\n- Chat, spam hype emotes!\n\n"
-        "Example 6:\nFACTS:\n- A terminal window showing 'BUILD FAILED' in red\n- Several stack trace lines are visible above the message\n\nREACTIONS:\n- Build failed? Time to rubber-duck it 🦆\n- Debuggers assemble!\n- Re-run with verbose, chat\n\n"
+    if ocr_text:
+        one_line = ' '.join(ocr_text.split())[:150]
+        describe_prompt += f"\n\nVisible screen text for context: '{one_line}'"
+
+    description = ""
+    try:
+        try:
+            desc_response = ollama.chat(
+                model=MODEL_NAME,
+                messages=[{
+                    'role': 'user',
+                    'content': describe_prompt,
+                    'images': [image_data]
+                }],
+                temperature=0.5,
+                max_tokens=128000
+            )
+        except TypeError:
+            desc_response = ollama.chat(
+                model=MODEL_NAME,
+                messages=[{
+                    'role': 'user',
+                    'content': describe_prompt,
+                    'images': [image_data]
+                }]
+            )
+
+        desc_text = ""
+        if hasattr(desc_response, 'message') and hasattr(desc_response.message, 'content'):
+            desc_text = desc_response.message.content
+        elif isinstance(desc_response, str):
+            desc_text = desc_response
+        elif isinstance(desc_response, dict):
+            if 'message' in desc_response and isinstance(desc_response['message'], dict) and 'content' in desc_response['message']:
+                desc_text = desc_response['message']['content']
+            elif 'content' in desc_response:
+                desc_text = desc_response['content']
+
+        description = _extract_description(desc_text)
+        if not description:
+            # Fallback: use the raw response as the description
+            description = desc_text.strip()[:200]
+    except Exception as e:
+        _safe_print(f"[Info] Vision description failed: {e}")
+        description = ""
+
+    # --- Phase 2: Search the web for context based on the description ---
+    web_context = ""
+    if description and WEB_SEARCH_AVAILABLE:
+        # Extract specific keywords — skips generic descriptions like "a web browser is open"
+        search_query = _extract_keywords(description)
+        if search_query:
+            _safe_print(f"[Info] Searching web for: {search_query}")
+            web_context = _search_web(search_query, max_results=3)
+            if web_context:
+                _safe_print(f"[Info] Web context retrieved ({len(web_context)} chars)")
+            else:
+                _safe_print("[Info] No web results found")
+        else:
+            _safe_print("[Info] Description too generic for web search, skipping")
+
+    # --- Phase 3: Generate chat reactions with full context ---
+    base_prompt = (
+        "You are an active live streaming chat audience. Look closely at this screenshot.\n"
+        "1. First, write a one-sentence DESCRIPTION of the specific activity, text, or game on the screen.\n"
+        "2. Then, write 1 to 3 short, distinct chat REACTIONS (2-12 words each) reacting DIRECTLY to that description. "
+        "Use typical Twitch/YouTube chat slang and emotes where appropriate.\n\n"
+        "You must output exactly in this format:\n"
+        "DESCRIPTION: <what you see>\n"
+        "REACTIONS:\n"
+        "- <reaction 1>\n"
+        "- <reaction 2>\n"
+        "- <reaction 3>"
     )
 
-    # If user provided spoken context, include it prominently so the model can use it
+    prompt_main = f"{base_prompt}\n\nScreenshot: ![screenshot]({image_path})\n\n"
+
+    if description:
+        prompt_main += f"Screen description: '{description}'\n\n"
+
+    if web_context:
+        prompt_main += f"Web context about what's on screen: {web_context}\n\n"
+
+    if ocr_text:
+        one_line = ' '.join(ocr_text.split())[:150]
+        prompt_main += f"Visible screen text for context: '{one_line}'\n\n"
+
     if user_context:
         uc = ' '.join(user_context.split())
-        base_prompt += f"USER_CONTEXT: {uc}\n\n; Use this user-provided context to influence reactions but do not invent new facts.\n\n"
-
-    # Embed image via markdown (many local LLM tooling accepts markdown image tags)
-    prompt_main = base_prompt + f"Screenshot: ![screenshot]({image_path})\n\n"
-
-    # If OCR produced text, prefill it into FACTS so the model must reference exact text
-    if ocr_text:
-        # sanitize single-line
-        one_line = ' '.join(ocr_text.split())
-        prefilled = "FACTS:\n- OCR_TEXT: \"" + one_line.replace('"', "'") + "\"\n\nREACTIONS:\n"
-        prompt = examples + prefilled + prompt_main
-    else:
-        prompt = examples + prompt_main
+        prompt_main += f"The streamer just said: '{uc}'\n\n"
 
     try:
-        # Try to call ollama.chat with low temperature for less hallucination
         try:
             response = ollama.chat(
                 model=MODEL_NAME,
                 messages=[{
                     'role': 'user',
-                    'content': prompt,
-                    'images': [image_path]
+                    'content': prompt_main,
+                    'images': [image_data]
                 }],
-                temperature=0.2,
-                max_tokens=200
+                temperature=0.8,
+                max_tokens=128000
             )
         except TypeError:
-            # some ollama client variants don't accept temperature/max_tokens
-            try:
-                response = ollama.chat(
-                    model=MODEL_NAME,
-                    messages=[{
-                        'role': 'user',
-                        'content': prompt,
-                        'images': [image_path]
-                    }]
-                )
-            except Exception:
-                # last resort: try the older prompt-only signature without extras
-                try:
-                    response = ollama.chat(model=MODEL_NAME, prompt=prompt)
-                except Exception as e:
-                    raise
-        except Exception:
-            # generic fallback: try prompt-only signatures
-            try:
-                response = ollama.chat(model=MODEL_NAME, prompt=prompt)
-            except Exception:
-                response = ollama.chat(model=MODEL_NAME, messages=[{'role':'user','content':prompt}])
+            response = ollama.chat(
+                model=MODEL_NAME,
+                messages=[{
+                    'role': 'user',
+                    'content': prompt_main,
+                    'images': [image_data]
+                }]
+            )
 
         # Normalize response to text
         content_text = ""
-        if isinstance(response, str):
+        if hasattr(response, 'message') and hasattr(response.message, 'content'):
+            content_text = response.message.content
+        elif isinstance(response, str):
             content_text = response
         elif isinstance(response, dict):
-            # Common patterns: {'message': {'content': '...'}}, or {'choices':[{'message':{'content':...}}]}
             if 'message' in response and isinstance(response['message'], dict) and 'content' in response['message']:
                 content_text = response['message']['content']
             elif 'content' in response:
                 content_text = response['content']
-            elif 'choices' in response and isinstance(response['choices'], list) and len(response['choices'])>0:
-                # choices may have text or message
-                first = response['choices'][0]
-                if isinstance(first, dict):
-                    if 'message' in first and isinstance(first['message'], dict) and 'content' in first['message']:
-                        content_text = first['message']['content']
-                    elif 'text' in first:
-                        content_text = first['text']
-                    elif 'content' in first:
-                        content_text = first['content']
-            else:
-                # last resort: stringify for debugging
-                content_text = json.dumps(response)
-        else:
-            content_text = str(response)
 
-        # If the response embeds a Message(...) or similar debug repr, try to extract the inner content
-        msg_match = re.search(r"message\s*=\s*Message\([^)]*content=([\'\"])(.*?)\1", content_text, re.DOTALL)
-        if msg_match:
-            content_text = msg_match.group(2)
-        else:
-            # fallback: extract any content='...'/content="..." pattern
-            content_match = re.search(r"content=([\'\"])(.*?)\1", content_text, re.DOTALL)
-            if content_match:
-                content_text = content_match.group(2)
+        # Phrases that indicate an AI disclaimer/apology/refusal rather than a real chat reaction
+        _AI_REFUSAL_PATTERNS = [
+            r'as an?\s+(ai|language\s+model|assistant)',
+            r'(cannot|cannot|can\'t|unable to)\s+(assist|provide|generate|analyze|process)',
+            r'(does not|do not|don\'t|not\s+able to)\s+(have|possess|contain)\s+(the\s+)?ability',
+            r'(against|violates?)\s+(policy|guidelines|rules|tos)',
+            r'(not\s+relevant|not\s+appropriate|not\s+related)\s+to\s+(the\s+)?(task|request|question)',
+            r'(I\'?m?\s+)?sorry\s*(,|but)',
+            r'trained\s+by\s+openai',
+            r'(my\s+)?purpose\s+is\s+to\s+assist',
+            r'not\s+ethically',
+            r'cannot\s+fulfill',
+            r'cannot\s+complete',
+            r'cannot\s+help',
+            r'not\s+possible\s+to',
+            r'no\s+visual\s+(information|content|data|input)',
+            r'text\s+based\s+(on|description)',
+            r'nothing\s+(in|on)\s+(the\s+)?(image|screenshot|screen)',
+            r'(black|blank|empty|dark)\s+(screen|image|screenshot)',
+        ]
+        _AI_REFUSAL_REGEX = re.compile('|'.join(_AI_REFUSAL_PATTERNS), re.IGNORECASE)
 
-        # Unescape common escaped newlines/quotes so strings like "a\n b" become real newlines
-        if isinstance(content_text, str):
-            content_text = content_text.replace('\\r\\n', '\r\n').replace('\\n', '\n').replace('\\"', '"').replace("\\'", "'")
-
-        # Split into lines and remove common list prefixes using regex
-        raw_lines = [ln.strip() for ln in content_text.strip().splitlines() if ln.strip()]
-        clean = []
-        for line in raw_lines:
-            # remove leading list bullets/numbers like "1. ", "- ", "* ", "• "
-            line = re.sub(r'^\s*([0-9]+[.)]\s*|[-\u2022\*]\s*)', '', line)
-            # also strip any leading '- ' or numbering characters
-            line = line.strip()
-            if line:
-                clean.append(line)
-        # If result looks like JSON array like ["a","b"], try to parse
-        if len(clean) == 1 and (clean[0].startswith('[') and clean[0].endswith(']')):
-            try:
-                arr = json.loads(clean[0])
-                if isinstance(arr, list):
-                    clean = [str(x).strip() for x in arr if str(x).strip()]
-            except Exception:
-                pass
-
-        # Remove stray trailing backslashes from unescaped output
-        clean = [c.rstrip('\\') for c in clean]
-
-        # Attempt to extract FACTS and REACTIONS sections if the model followed the required format
-        facts = []
-        reactions = []
-        fact_idx = None
-        react_idx = None
-        for i, v in enumerate(clean):
-            up = v.strip().upper()
-            if up.startswith('FACTS'):
-                fact_idx = i
-            if up.startswith('REACTIONS'):
-                react_idx = i
-                break
-        # collect facts lines (between FACTS: and REACTIONS:)
-        if fact_idx is not None:
-            for v in clean[fact_idx+1: react_idx if react_idx is not None else None]:
-                if not v or v.strip().endswith(':'):
-                    break
-                facts.append(v)
-        # collect reactions lines (after REACTIONS:)
-        if react_idx is not None:
-            for v in clean[react_idx+1:]:
-                if not v or v.strip().endswith(':'):
-                    break
-                reactions.append(v)
-
-        # If OCR was available and produced text, include it as a fact for relevance checks
-        if ocr_text:
-            facts.append('OCR_TEXT: ' + ' '.join(ocr_text.split()))
-
-        # Relevance scoring using exact and fuzzy matches
-        def words(s):
-            return [w.lower() for w in re.findall(r"\w+", s) if len(w)>2]
-        fact_words = set()
-        for f in facts:
-            fact_words.update(words(f))
-
-        def fuzzy_match(word, candidates, cutoff=0.7):
-            # return True if word is similar to any candidate word
-            for c in candidates:
-                if difflib.SequenceMatcher(None, word, c).ratio() >= cutoff:
-                    return True
+        def _is_ai_refusal(text: str) -> bool:
+            """Return True if the line looks like an AI disclaimer/refusal rather than a chat reaction."""
+            word_count = len(text.split())
+            if word_count > 15:
+                return True
+            if _AI_REFUSAL_REGEX.search(text):
+                return True
             return False
 
-        scored = []  # list of (score, reaction)
-        for r in reactions:
-            rw = words(r)
-            exact = len(set(rw) & fact_words)
-            fuzzy = 0
-            for w in rw:
-                if fuzzy_match(w, fact_words):
-                    fuzzy += 1
-            score = exact * 2 + fuzzy
-            scored.append((score, r))
+        # Parse the output to ONLY extract the chat reactions, skipping the description
+        raw_lines = [ln.strip() for ln in content_text.strip().splitlines() if ln.strip()]
+        clean_reactions = []
+        is_reaction_section = False
+        
+        for line in raw_lines:
+            if line.upper().startswith("REACTIONS"):
+                is_reaction_section = True
+                continue
+            elif line.upper().startswith("DESCRIPTION"):
+                is_reaction_section = False
+                continue
+                
+            if is_reaction_section:
+                clean_line = re.sub(r'^\s*([0-9]+[.)]\s*|[-\u2022\*]\s*)', '', line).strip()
+                clean_line = re.sub(r'^["\'](.*)["\']$', r'\1', clean_line).strip()
+                if clean_line and not _is_ai_refusal(clean_line):
+                    clean_reactions.append(clean_line)
 
-        # Keep reactions with score >= 1 (either exact or fuzzy match)
-        filtered_reactions = [r for sc, r in scored if sc >= 1]
-        if filtered_reactions:
-            return filtered_reactions
+        # If parsing failed, fallback to returning whatever it outputted that looks like a list
+        if not clean_reactions:
+             for line in raw_lines:
+                 if line.startswith("-") or line.startswith("*"):
+                     clean_line = re.sub(r'^\s*([0-9]+[.)]\s*|[-\u2022\*]\s*)', '', line).strip()
+                     clean_line = re.sub(r'^["\'](.*)["\']$', r'\1', clean_line).strip()
+                     if clean_line and not _is_ai_refusal(clean_line):
+                         clean_reactions.append(clean_line)
 
-        # If strict filtering removed all reactions, re-prompt the model with explicit facts to force grounded replies
-        if facts:
-            retry_prompt = (
-                "The previous reply did not produce reactions that reference the FACTS.\n"
-                "You will be given a short FACTS list. Using ONLY those facts, produce exactly 3 short chat REACTIONS (one per line). Each reaction MUST include at least one word or phrase from the FACTS. Do NOT invent new facts or details. Output exactly 3 lines and nothing else.\n\n"
-                "FORMAT EXAMPLE:\n"
-                "FACTS:\n"
-                "- A red health bar at top-left\n\n"
-                "REACTIONS:\n"
-                "- Pog that red health bar saved them!\n"
-                "- That 'YOU DIED' text is brutal, rip.\n"
-                "- Chat, spam the revive emotes.\n\n"
-                "Now produce reactions for these FACTS:\n"
-                "FACTS:\n"
-            )
-            for f in facts:
-                retry_prompt += f"- {f}\n"
-            retry_prompt += "\nREACTIONS:\n"
-            try:
-                try:
-                    retry_resp = ollama.chat(model=MODEL_NAME, messages=[{'role':'user','content':retry_prompt}], temperature=0.15, max_tokens=120)
-                except TypeError:
-                    retry_resp = ollama.chat(model=MODEL_NAME, messages=[{'role':'user','content':retry_prompt}])
-
-                # normalize retry_resp into text similar to main flow
-                retry_text = ''
-                if isinstance(retry_resp, str):
-                    retry_text = retry_resp
-                elif isinstance(retry_resp, dict):
-                    if 'message' in retry_resp and isinstance(retry_resp['message'], dict) and 'content' in retry_resp['message']:
-                        retry_text = retry_resp['message']['content']
-                    elif 'content' in retry_resp:
-                        retry_text = retry_resp['content']
-                    elif 'choices' in retry_resp and isinstance(retry_resp['choices'], list) and len(retry_resp['choices'])>0:
-                        first = retry_resp['choices'][0]
-                        if isinstance(first, dict):
-                            if 'message' in first and isinstance(first['message'], dict) and 'content' in first['message']:
-                                retry_text = first['message']['content']
-                            elif 'text' in first:
-                                retry_text = first['text']
-                            elif 'content' in first:
-                                retry_text = first['content']
-                    else:
-                        retry_text = json.dumps(retry_resp)
-                else:
-                    # fallback to string repr for custom objects
-                    retry_text = str(retry_resp)
-
-
-                # split and clean
-                lines = [ln.strip() for ln in retry_text.strip().splitlines() if ln.strip()]
-                cleaned = [re.sub(r'^\s*([0-9]+[.)]\s*|[-\u2022\*]\s*)', '', ln).strip() for ln in lines]
-                # score again
-                final = []
-                for ln in cleaned:
-                    rw = words(ln)
-                    if any(fuzzy_match(w, fact_words) or (set([w]) & fact_words) for w in rw):
-                        final.append(ln)
-                if final:
-                    return final[:5]
-            except Exception as e:
-                pass
-
-        # As a last resort, return empty (irrelevant)
-        return []
+        return clean_reactions[:5]
 
     except Exception as e:
         print(f"\n[System Error]: Failed to contact Ollama or parse response. Error: {e}")
@@ -648,19 +756,31 @@ def main():
             for reaction in reactions:
                 if reaction:
                     user = random.choice(USERNAMES)
+                    # Ensure reaction is a clean string without model metadata
+                    reaction_str = str(reaction).strip()
+                    # Skip if this looks like raw model output (contains Ollama response metadata)
+                    ollama_meta_keys = ['model=', 'created_at=', 'done=True', 'done_reason=', 'total_duration=', 'load_duration=', 'prompt_eval_count=', 'prompt_eval_duration=', 'eval_count=', 'eval_duration=', 'message=Message(', 'logprobs=', 'role=', 'tool_calls=']
+                    if any(k in reaction_str for k in ollama_meta_keys):
+                        continue
+                    # Also skip if line starts with typical Ollama repr patterns (key='value' pairs)
+                    if re.match(r"^\w+='\w+'", reaction_str):
+                        continue
+                    # Strip any remaining surrounding double or single quotes from the reaction
+                    reaction_str = re.sub(r'^["\'](.*)["\']$', r'\1', reaction_str).strip()
                     try:
-                        _safe_print(f"[{user}]: {reaction}")
+                        _safe_print(f"[{user}]: {reaction_str}")
                     except Exception:
                         # Last-resort fallback
                         try:
-                            sys.stdout.buffer.write((f"[{user}]: {reaction}\n").encode(sys.stdout.encoding or 'utf-8', 'replace'))
+                            sys.stdout.buffer.write((f"[{user}]: {reaction_str}\n").encode(sys.stdout.encoding or 'utf-8', 'replace'))
                         except Exception:
                             pass
                     # Stagger the messages so they feel like a live scrolling chat
                     time.sleep(random.uniform(0.4, 1.2))
 
-            # 5. Wait a moment before evaluating the screen again
-            time.sleep(4)
+            # 5. Wait for the next screen evaluation — the model had as long as it needed
+            #    to analyze the image during the blocking ollama.chat() call above.
+            time.sleep(random.uniform(3.5, 5.0))
 
     except KeyboardInterrupt:
         print("\nStopping chat simulation. Goodbye!")
